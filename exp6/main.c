@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h> // 用于 memset, memcpy 等内存操作函数
 #include <GL/glut.h> // 包含 GLUT 库
+#include <math.h>   // 用于 fmax, fmin
 
 // 定义网格大小 N
 // 流体模拟的有效区域是 N x N 个网格单元。
@@ -24,28 +25,30 @@
 // 全局变量，用于存储流体状态的数组。
 // u, v: 当前时刻的速度场分量 (u 为 x 方向，v 为 y 方向)
 // u_prev, v_prev: 前一时刻的速度场分量，也用作临时缓冲区
-// dens: 当前时刻的密度值 (例如烟雾浓度)
-// dens_prev: 前一时刻的密度值，也用作临时缓冲区
+// dens_r, dens_g, dens_b: 当前时刻的密度值 (红、绿、蓝分量)
+// dens_prev_r, dens_prev_g, dens_prev_b: 前一时刻的密度值，也用作临时缓冲区
 static float *u, *v, *u_prev, *v_prev;
-static float *dens, *dens_prev;
+static float *dens_r, *dens_g, *dens_b;
+static float *dens_prev_r, *dens_prev_g, *dens_prev_b;
+static int *is_obstacle; // 障碍物标记数组：0为流体，1为障碍物
 
 // 模拟参数
 static float dt = 0.1f; // 时间步长 (delta t)
-// 粘度系数 (viscosity)，衡量流体抵抗形变的能力。
-// 在扩散项计算中使用。
-static float visc = 0.0000001f; // 设为一个很小的值以减少扩散影响
-// 密度扩散系数 (diffusion)，衡量密度扩散速率。
-// 在密度扩散计算中使用。
-static float diff = 0.0000001f; // 设为一个很小的值以减少扩散影响
+static float visc = 0.000001f; // 粘度系数 (viscosity)，设为一个很小的值以减少扩散影响
+static float diff = 0.000001f; // 密度扩散系数 (diffusion)，设为一个很小的值以减少扩散影响
 
 // 窗口尺寸
 static int win_width = 512;
 static int win_height = 512;
 
+// 鼠标拖拽信息
+static int mouse_down[3]; // 鼠标按键状态
+static int last_x, last_y; // 上一帧鼠标位置
+static float current_draw_color[3] = {1.0f, 1.0f, 1.0f}; // 当前绘制颜色 (R, G, B), 默认白色
+
 //--------------------------------------------------------------------------------------
 // 函数声明
 //--------------------------------------------------------------------------------------
-// 将参数 N 重命名为 gridSize，避免与宏 N 冲突
 static int allocate_data(void);
 static void free_data(void);
 static void add_source(int gridSize, float *x, float *s, float dt);
@@ -56,6 +59,10 @@ static void advect(int gridSize, int b, float *d, float *d0, float *u, float *v,
 static void project(int gridSize, float *u, float *v, float *p, float *div);
 static void vel_step(int gridSize, float *u, float *v, float *u0, float *v0, float visc, float dt);
 static void dens_step(int gridSize, float *x, float *x0, float *u, float *v, float diff, float dt);
+
+// 障碍物相关函数
+static void init_obstacles(void);
+static void enforce_obstacle_boundaries(int gridSize, float *x, int b);
 
 // GLUT 相关函数
 static void display(void);
@@ -84,10 +91,20 @@ static int allocate_data(void) {
     v = (float *)malloc(size * sizeof(float));
     u_prev = (float *)malloc(size * sizeof(float));
     v_prev = (float *)malloc(size * sizeof(float));
-    dens = (float *)malloc(size * sizeof(float));
-    dens_prev = (float *)malloc(size * sizeof(float));
+    
+    // 为 RGB 密度通道分配内存
+    dens_r = (float *)malloc(size * sizeof(float));
+    dens_g = (float *)malloc(size * sizeof(float));
+    dens_b = (float *)malloc(size * sizeof(float));
+    dens_prev_r = (float *)malloc(size * sizeof(float));
+    dens_prev_g = (float *)malloc(size * sizeof(float));
+    dens_prev_b = (float *)malloc(size * sizeof(float));
 
-    if (!u || !v || !u_prev || !v_prev || !dens || !dens_prev) {
+    // 为障碍物标记数组分配内存
+    is_obstacle = (int *)malloc(size * sizeof(int));
+
+    if (!u || !v || !u_prev || !v_prev || !dens_r || !dens_g || !dens_b ||
+        !dens_prev_r || !dens_prev_g || !dens_prev_b || !is_obstacle) {
         fprintf(stderr, "无法分配数据内存\n");
         return 0;
     }
@@ -97,8 +114,15 @@ static int allocate_data(void) {
     memset(v, 0, size * sizeof(float));
     memset(u_prev, 0, size * sizeof(float));
     memset(v_prev, 0, size * sizeof(float));
-    memset(dens, 0, size * sizeof(float));
-    memset(dens_prev, 0, size * sizeof(float));
+    
+    memset(dens_r, 0, size * sizeof(float));
+    memset(dens_g, 0, size * sizeof(float));
+    memset(dens_b, 0, size * sizeof(float));
+    memset(dens_prev_r, 0, size * sizeof(float));
+    memset(dens_prev_g, 0, size * sizeof(float));
+    memset(dens_prev_b, 0, size * sizeof(float));
+
+    memset(is_obstacle, 0, size * sizeof(int)); // 默认所有单元格为流体
 
     return 1;
 }
@@ -111,8 +135,13 @@ static void free_data(void) {
     if (v) free(v);
     if (u_prev) free(u_prev);
     if (v_prev) free(v_prev);
-    if (dens) free(dens);
-    if (dens_prev) free(dens_prev);
+    if (dens_r) free(dens_r);
+    if (dens_g) free(dens_g);
+    if (dens_b) free(dens_b);
+    if (dens_prev_r) free(dens_prev_r);
+    if (dens_prev_g) free(dens_prev_g);
+    if (dens_prev_b) free(dens_prev_b);
+    if (is_obstacle) free(is_obstacle);
 }
 
 /**
@@ -121,49 +150,33 @@ static void free_data(void) {
  * @param x 目标数组 (当前时刻的值)。
  * @param s 源数组 (外部源的值)。
  * @param dt 时间步长。
+ *
+ * 改进：不向障碍物单元格添加源。
  */
 void add_source(int gridSize, float *x, float *s, float dt) {
     int i, size = (gridSize + 2) * (gridSize + 2);
     for (i = 0; i < size; i++) {
-        // 数学运算：x[i] = x[i] + dt * s[i]
-        // 解释：在当前时间步长 dt 内，将源 s[i] 乘以 dt 累加到 x[i] 上。
-        // 这对应于 Navier-Stokes 方程中的外力项 F 或密度方程中的源项 S，表示外部因素对流体状态的改变。
-        x[i] += dt * s[i];
+        if (!is_obstacle[i]) { // 仅当不是障碍物时才添加源
+            x[i] += dt * s[i];
+        }
     }
 }
 
 /**
- * @brief 设置边界条件。
+ * @brief 设置边界条件 (仅处理外部边界)。
  * @param gridSize 网格大小 N。
  * @param b 边界类型标识。b=0 表示密度/压力，b=1 表示 u 分量速度，b=2 表示 v 分量速度。
  * @param x 要设置边界的数组。
- *
- * 根据 Stam 的实现，当 b=0 时，对密度和压力场应用 Neumann 边界条件（法向导数为 0），
- * 即边界值等于相邻内部网格的值。
- * 当 b=1 或 b=2 时，对速度场应用无滑移 (no-slip) 边界条件，即边界速度为 0。
- * 具体实现中，通过设置边界处的速度为相邻内部网格速度的负值来实现无滑移。
- * 角点的处理是取相邻两个边界网格的平均值。
  */
 void set_bnd(int gridSize, int b, float *x) {
     int i;
     for (i = 1; i <= gridSize; i++) {
-        // 左右边界 (x 方向速度 u，法向导数为 0 的密度/压力)
-        // x[IX(0, i)]: 左边界，x[IX(1, i)]: 左边界内侧第一个网格
-        // 当 b=1 (u 速度) 时，x[IX(0,i)] = -x[IX(1,i)] 实现 u=0 (无滑移条件)。
-        // 当 b!=1 (v 速度, 密度, 压力) 时，x[IX(0,i)] = x[IX(1,i)] 实现法向导数为 0 (Neumann 条件)。
         x[IX(0, i)] = b == 1 ? -x[IX(1, i)] : x[IX(1, i)];
         x[IX(gridSize + 1, i)] = b == 1 ? -x[IX(gridSize, i)] : x[IX(gridSize, i)];
-
-        // 上下边界 (y 方向速度 v，法向导数为 0 的密度/压力)
-        // x[IX(i, 0)]: 下边界，x[IX(i, 1)]: 下边界内侧第一个网格
-        // 当 b=2 (v 速度) 时，x[IX(i,0)] = -x[IX(i,1)] 实现 v=0 (无滑移条件)。
-        // 当 b!=2 (u 速度, 密度, 压力) 时，x[IX(i,0)] = x[IX(i,1)] 实现法向导数为 0 (Neumann 条件)。
         x[IX(i, 0)] = b == 2 ? -x[IX(i, 1)] : x[IX(i, 1)];
         x[IX(i, gridSize + 1)] = b == 2 ? -x[IX(i, gridSize)] : x[IX(i, gridSize)];
     }
 
-    // 角点处理
-    // 角点值取其相邻两个边界点的平均值，这有助于在迭代过程中稳定边界条件。
     x[IX(0, 0)] = 0.5f * (x[IX(1, 0)] + x[IX(0, 1)]);
     x[IX(0, gridSize + 1)] = 0.5f * (x[IX(1, gridSize + 1)] + x[IX(0, gridSize)]);
     x[IX(gridSize + 1, 0)] = 0.5f * (x[IX(gridSize, 0)] + x[IX(gridSize + 1, 1)]);
@@ -171,263 +184,212 @@ void set_bnd(int gridSize, int b, float *x) {
 }
 
 /**
- * @brief 泊松方程的通用迭代求解器。
+ * @brief 强制障碍物单元格的数值为0。
  * @param gridSize 网格大小 N。
- * @param b 边界类型标识。
- * @param x 待求解的数组 (当前迭代值)。
- * @param x0 右侧项/源项数组 (初始值或上一时间步的值)。
- * @param a 迭代公式中的参数 a。
- * @param c 迭代公式中的参数 c。
- *
- * 该函数用于求解形如 Ax=b 的线性方程组，特别是扩散项和压力泊松方程。
- * 迭代公式来自泊松方程和黏度扩散方程的离散化形式。
- * 通用形式：$x_{i,j}^{(k+1)} = \frac{(x_{i+1,j}^{(k)} + x_{i-1,j}^{(k)} + x_{i,j+1}^{(k)} + x_{i,j-1}^{(k)}) + \alpha b_{i,j}}{\beta}$。
- * 这里 `lin_solve` 内部的迭代公式为：
- * $x_{i,j}^{(k+1)} = \frac{x0_{i,j} + a \times (x_{i-1,j}^{(k)} + x_{i+1,j}^{(k)} + x_{i,j-1}^{(k)} + x_{i,j+1}^{(k)})}{c}$。
- * 它通过雅可比迭代或高斯-赛德尔迭代（此处由于循环顺序，更像高斯-赛德尔）进行求解。
- * 迭代 20 次是为了收敛到近似解。
+ * @param x 要处理的数组。
+ * @param b 边界类型标识 (0: 密度/压力, 1: u速度, 2: v速度)。
+ */
+static void enforce_obstacle_boundaries(int gridSize, float *x, int b) {
+    int size = (gridSize + 2) * (gridSize + 2);
+    for (int i = 0; i < size; i++) {
+        if (is_obstacle[i]) {
+            x[i] = 0.0f; // 障碍物内部的值设为0
+        }
+    }
+}
+
+
+/**
+ * @brief 泊松方程的通用迭代求解器。
+ * 改进：在每次迭代后强制障碍物单元格的值为0。
  */
 void lin_solve(int gridSize, int b, float *x, float *x0, float a, float c) {
-    for (int k = 0; k < 20; k++) { // 迭代次数，通常 20 次足以获得稳定结果
+    for (int k = 0; k < 20; k++) { // 迭代次数
         FOR_EACH_CELL
-            // 数学运算：x[IX(i, j)] = (x0[IX(i, j)] + a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] + x[IX(i, j - 1)] + x[IX(i, j + 1)])) / c;
-            // 解释：求解当前网格 (i,j) 的值，基于其旧值 x0[IX(i,j)] 和相邻网格的当前/旧值。
-            // 这是泊松方程 $\nabla^2 p = \text{div}$ 或黏度扩散方程 $(I - \nu \Delta t \nabla^2) u = u_{prev}$ 离散化后通过迭代方法求解的公式。
-            // 对于扩散项：x0 对应于上一时刻的速度 u_prev，a = $\nu \Delta t / (\Delta x)^2$，c = 1 + 4a。
-            // 对于压力泊松方程：x0 对应于散度 div，a = $(\Delta x)^2$，c = 4。
-            // Stam 的简化实现中，通过调整传入的 a 和 c 来使用同一个函数求解这两种方程。
+            if (is_obstacle[IX(i, j)]) continue; // 障碍物单元格不参与计算
+
             x[IX(i, j)] = (x0[IX(i, j)] + a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] +
                                                x[IX(i, j - 1)] + x[IX(i, j + 1)])) / c;
         END_FOR
-        set_bnd(gridSize, b, x); // 每次迭代后更新边界条件，确保边界值符合要求
+        enforce_obstacle_boundaries(gridSize, x, b); // 强制障碍物单元格为0
+        set_bnd(gridSize, b, x); // 更新外部边界条件
     }
 }
 
 /**
  * @brief 计算流体的扩散项。
- * @param gridSize 网格大小 N。
- * @param b 边界类型标识。
- * @param x 目标数组 (当前时刻的值)。
- * @param x0 源数组 (上一时刻的值)。
- * @param diff 扩散系数 (可以是粘度 visc 或密度扩散系数 diff)。
- * @param dt 时间步长。
- *
- * 扩散项的偏微分方程为：$\frac{\partial q}{\partial t} = \kappa \nabla^{2} q$，其中 q 是待扩散的量，$\kappa$ 是扩散系数。
- * Stam 采用隐式积分形式：$(I - \kappa \Delta t \nabla^{2}) q(x, t+\Delta t) = q(x, t)$。
- * 离散化后，这是一个泊松方程，通过 lin_solve 函数求解。
  */
 void diffuse(int gridSize, int b, float *x, float *x0, float diff, float dt) {
-    // 数学运算：a = dt * diff * gridSize * gridSize;
-    // 解释：计算迭代求解器中的参数 a。
-    // 在扩散方程离散化中，$(\Delta x)^2 = (1/gridSize)^2 = 1/gridSize^2$。
-    // 迭代公式中的 a 对应 $\kappa \Delta t / (\Delta x)^2 = \text{diff} \times \text{dt} \times \text{gridSize}^2$。
     float a = dt * diff * gridSize * gridSize;
-    // 调用通用泊松求解器 lin_solve。
-    // c 的值为 1 + 4*a，对应于扩散方程离散化后系数矩阵对角线元素。
-    // 迭代公式为：$x_{i,j}^{(k+1)} = \frac{x0_{i,j} + a \times (x_{i-1,j}^{(k)} + x_{i+1,j}^{(k)} + x_{i,j-1}^{(k)} + x_{i,j+1}^{(k)})}{1 + 4a}$。
     lin_solve(gridSize, b, x, x0, a, 1 + 4 * a);
 }
 
 /**
  * @brief 计算流体的平流项 (Advection)。
- * @param gridSize 网格大小 N。
- * @param b 边界类型标识。
- * @param d 目标数组 (当前时刻的值)。
- * @param d0 源数组 (上一时刻的值)。
- * @param u 速度场 u 分量。
- * @param v 速度场 v 分量。
- * @param dt 时间步长。
- *
- * 平流项描述了流体中某个量（如速度或密度）如何沿着速度场移动。
- * Stam 采用隐式积分法 (Backwards Tracing)，从当前点 P 逆向追踪粒子轨道，找到它在上一时刻 P' 的位置，
- * 然后将 P' 处的量（通过双线性插值获得）复制到 P 点。
- * 数学公式：$q(x, t+\Delta t) = q(x - u(x, t) \Delta t, t)$，其中 q 是待平流的量，u 是速度场。
+ * 改进：在插值时考虑障碍物，并强制障碍物单元格的密度为0。
  */
 void advect(int gridSize, int b, float *d, float *d0, float *u, float *v, float dt) {
     int i, j, i0, j0, i1, j1;
     float x, y, s0, t0, s1, t1, dt0;
 
-    // 数学运算：dt0 = dt * gridSize;
-    // 解释：将时间步长 dt 乘以 gridSize，将物理距离转换为网格距离。
-    // 速度场 u, v 通常表示每单位物理距离的速度，乘以 dt 得到物理位移，再乘以 gridSize 得到网格位移。
     dt0 = dt * gridSize;
 
     FOR_EACH_CELL
-        // 数学运算：x = i - dt0 * u[IX(i, j)]; y = j - dt0 * v[IX(i, j)];
-        // 解释：逆向追踪粒子位置。从当前网格中心 (i,j) 出发，沿着速度场 (u,v) 的负方向移动 dt0 的距离，找到粒子在上一时刻的源点 (x, y)。
-        // 这里 (i,j) 是网格中心在整数网格坐标系中的位置。
+        if (is_obstacle[IX(i, j)]) { // 障碍物单元格不计算平流
+            d[IX(i, j)] = 0;
+            continue;
+        }
+
         x = i - dt0 * u[IX(i, j)];
         y = j - dt0 * v[IX(i, j)];
 
-        // 边界钳制：确保追踪到的源点位置 (x, y) 在有效网格范围内 [0.5, gridSize+0.5]。
-        // 0.5f 和 gridSize+0.5f 是为了避免整数截断和确保插值点总是在网格中心之间。
         if (x < 0.5f) x = 0.5f;
         if (x > gridSize + 0.5f) x = gridSize + 0.5f;
-        i0 = (int)x; // 源点 x 坐标的整数部分，作为左下角网格的 x 索引。
-        i1 = i0 + 1; // 右上角网格的 x 索引。
+        i0 = (int)x;
+        i1 = i0 + 1;
 
         if (y < 0.5f) y = 0.5f;
         if (y > gridSize + 0.5f) y = gridSize + 0.5f;
-        j0 = (int)y; // 源点 y 坐标的整数部分，作为左下角网格的 y 索引。
-        j1 = j0 + 1; // 右上角网格的 y 索引。
+        j0 = (int)y;
+        j1 = j0 + 1;
 
-        // 双线性插值权重计算。
-        // s1 是 x 在网格单元内的相对位置 (小数部分)，s0 = 1 - s1 是其补数。
-        // t1 是 y 在网格单元内的相对位置 (小数部分)，t0 = 1 - t1 是其补数。
         s1 = x - i0;
         s0 = 1 - s1;
         t1 = y - j0;
         t0 = 1 - t1;
 
-        // 数学运算：双线性插值
-        // d[IX(i, j)] = s0 * (t0 * d0[IX(i0, j0)] + t1 * d0[IX(i0, j1)]) + s1 * (t0 * d0[IX(i1, j0)] + t1 * d0[IX(i1, j1)]);
-        // 解释：根据源点 (x, y) 周围四个相邻网格点 (i0,j0), (i1,j0), (i0,j1), (i1,j1) 在上一时刻的值 d0 进行双线性插值。
-        // 首先在 x 方向进行两次线性插值：
-        // 在 j0 行，(x, j0) 处的值近似为：$d_{x,j0} = s0 \times d0_{i0,j0} + s1 \times d0_{i1,j0}$
-        // 在 j1 行，(x, j1) 处的值近似为：$d_{x,j1} = s0 \times d0_{i0,j1} + s1 \times d0_{i1,j1}$
-        // 然后在 y 方向进行一次线性插值：
-        // 在 x 列，(x, y) 处的值近似为：$d_{x,y} = t0 \times d_{x,j0} + t1 \times d_{x,j1}$
-        // 将上面两步合并，得到最终的双线性插值公式。
-        d[IX(i, j)] = s0 * (t0 * d0[IX(i0, j0)] + t1 * d0[IX(i0, j1)]) +
-                      s1 * (t0 * d0[IX(i1, j0)] + t1 * d0[IX(i1, j1)]);
+        // 双线性插值时，如果插值点落在障碍物内，则将其视为0
+        float d00 = is_obstacle[IX(i0, j0)] ? 0.0f : d0[IX(i0, j0)];
+        float d10 = is_obstacle[IX(i1, j0)] ? 0.0f : d0[IX(i1, j0)];
+        float d01 = is_obstacle[IX(i0, j1)] ? 0.0f : d0[IX(i0, j1)];
+        float d11 = is_obstacle[IX(i1, j1)] ? 0.0f : d0[IX(i1, j1)];
+
+        d[IX(i, j)] = s0 * (t0 * d00 + t1 * d01) +
+                      s1 * (t0 * d10 + t1 * d11);
     END_FOR
 
-    set_bnd(gridSize, b, d); // 更新边界条件
+    enforce_obstacle_boundaries(gridSize, d, b); // 强制障碍物单元格为0
+    set_bnd(gridSize, b, d); // 更新外部边界条件
 }
 
 /**
  * @brief 投射操作 (Project)，用于确保速度场的无散度性（不可压缩性）。
- * @param gridSize 网格大小 N。
- * @param u 速度场 u 分量 (待修正)。
- * @param v 速度场 v 分量 (待修正)。
- * @param p 压力场 (临时数组，用于存储泊松方程的解)。
- * @param div 散度场 (临时数组，用于存储速度场的散度)。
- *
- * 根据 Helmholtz-Hodage 分解定律，任何矢量场 w 都可以分解为一个无散度矢量场 u
- * 和一个标量场 p 的梯度之和：w = u + $\nabla$p。
- * 为了得到无散度的速度场 u，我们可以计算 u = w - $\nabla$p。
- * 其中，压力 p 可以通过求解泊松方程 $\nabla^{2}p = \nabla \cdot w$ 得到。
- * 这里的 w 是经过平流、扩散和外力作用后的临时速度场。
+ * 改进：在计算散度时考虑障碍物，并在计算后强制障碍物单元格的速度为0。
  */
 void project(int gridSize, float *u, float *v, float *p, float *div) {
     int i, j;
 
     FOR_EACH_CELL
-        // 数学运算：div[IX(i, j)] = -0.5f * (u[IX(i + 1, j)] - u[IX(i - 1, j)] + v[IX(i, j + 1)] - v[IX(i, j - 1)]) / gridSize;
-        // 解释：计算速度场 w 的散度 (divergence) $\nabla \cdot w = \frac{\partial u}{\partial x} + \frac{\partial v}{\partial y}$。
-        // 采用中心差分法近似导数。$\frac{\partial u}{\partial x}$ 近似为 $(u_{i+1,j} - u_{i-1,j}) / (2\Delta x)$。
-        // 这里的 $\Delta x = 1/gridSize$，所以 $1/(2\Delta x) = gridSize/2$。
-        // 公式中的 -0.5f/gridSize 来自于泊松方程 $\nabla^{2}p = \nabla \cdot w$ 中的项。
-        // 这里的 div 数组存储的是 $(\Delta x \Delta y) \nabla \cdot w$ 的近似值。
-        div[IX(i, j)] = -0.5f * (u[IX(i + 1, j)] - u[IX(i - 1, j)] +
-                                 v[IX(i, j + 1)] - v[IX(i, j - 1)]) / gridSize;
-        p[IX(i, j)] = 0; // 初始化压力场 p 为 0。
+        if (is_obstacle[IX(i, j)]) { // 障碍物单元格不计算散度
+            div[IX(i, j)] = 0;
+            p[IX(i, j)] = 0;
+            continue;
+        }
+        
+        // 计算散度时，如果相邻单元格是障碍物，其速度视为0
+        float u_east = is_obstacle[IX(i + 1, j)] ? 0.0f : u[IX(i + 1, j)];
+        float u_west = is_obstacle[IX(i - 1, j)] ? 0.0f : u[IX(i - 1, j)];
+        float v_north = is_obstacle[IX(i, j + 1)] ? 0.0f : v[IX(i, j + 1)];
+        float v_south = is_obstacle[IX(i, j - 1)] ? 0.0f : v[IX(i, j - 1)];
+
+        div[IX(i, j)] = -0.5f * (u_east - u_west + v_north - v_south) / gridSize;
+        p[IX(i, j)] = 0;
     END_FOR
 
-    // 设置散度场和压力场的边界条件。
+    enforce_obstacle_boundaries(gridSize, div, 0); // 强制障碍物单元格的散度为0
+    enforce_obstacle_boundaries(gridSize, p, 0);   // 强制障碍物单元格的压力为0
     set_bnd(gridSize, 0, div);
     set_bnd(gridSize, 0, p);
 
-    // 求解泊松压力方程 $\nabla^{2}p = \nabla \cdot w$。
-    // 调用 lin_solve 求解压力 p。
-    // 离散化形式为：$\frac{p_{i+1,j} - 2p_{i,j} + p_{i-1,j}}{(\Delta x)^2} + \frac{p_{i,j+1} - 2p_{i,j} + p_{i,j-1}}{(\Delta y)^2} = \nabla \cdot w_{i,j}$
-    // 若 $\Delta x = \Delta y$，则 $\frac{p_{i+1,j} + p_{i-1,j} + p_{i,j+1} + p_{i,j-1} - 4p_{i,j}}{(\Delta x)^2} = \nabla \cdot w_{i,j}$
-    // 整理得：$4p_{i,j} - (p_{i+1,j} + p_{i-1,j} + p_{i,j+1} + p_{i,j-1}) = -(\Delta x)^2 \nabla \cdot w_{i,j}$
-    // 迭代公式：$p_{i,j}^{(k+1)} = \frac{(p_{i+1,j}^{(k)} + p_{i-1,j}^{(k)} + p_{i,j+1}^{(k)} + p_{i,j-1}^{(k)}) - (\Delta x)^{2}\nabla\cdot w_{i,j}}{4}$。
-    // Stam 的实现中，lin_solve(gridSize, 0, p, div, 1, 4) 对应于迭代公式中的 x=p, x0=div, a=1, c=4。
-    // 这里的 div 存储的是 $(\Delta x \Delta y) \nabla \cdot w$ 的近似值，所以迭代公式略有不同，但数值上是等价的。
+    // 求解泊松压力方程
     lin_solve(gridSize, 0, p, div, 1, 4);
 
     FOR_EACH_CELL
-        // 数学运算：u[IX(i, j)] -= 0.5f * gridSize * (p[IX(i + 1, j)] - p[IX(i - 1, j)]);
-        // 数学运算：v[IX(i, j)] -= 0.5f * gridSize * (p[IX(i, j + 1)] - p[IX(i, j - 1)]);
-        // 解释：根据 Helmholtz-Hodage 分解，从原始速度场 w 中减去压力场的梯度 $\nabla p$ 得到无散度速度场 u。
-        // u_new = w - $\nabla p$。 $\nabla p = (\frac{\partial p}{\partial x}, \frac{\partial p}{\partial y})$。
-        // $\frac{\partial p}{\partial x}$ 近似为 $(p_{i+1,j} - p_{i-1,j}) / (2\Delta x)$。
-        // 这里的 $0.5f * gridSize$ 对应 $1/(2\Delta x)$。
-        // w 在这里就是经过前面步骤（外力、扩散、平流）后的 u 和 v 数组。
-        u[IX(i, j)] -= 0.5f * gridSize * (p[IX(i + 1, j)] - p[IX(i - 1, j)]);
-        v[IX(i, j)] -= 0.5f * gridSize * (p[IX(i, j + 1)] - p[IX(i, j - 1)]);
+        if (is_obstacle[IX(i, j)]) { // 障碍物单元格的速度保持为0
+            u[IX(i, j)] = 0;
+            v[IX(i, j)] = 0;
+            continue;
+        }
+
+        // 减去压力梯度时，如果相邻单元格是障碍物，其压力视为0
+        float p_east = is_obstacle[IX(i + 1, j)] ? 0.0f : p[IX(i + 1, j)];
+        float p_west = is_obstacle[IX(i - 1, j)] ? 0.0f : p[IX(i - 1, j)];
+        float p_north = is_obstacle[IX(i, j + 1)] ? 0.0f : p[IX(i, j + 1)];
+        float p_south = is_obstacle[IX(i, j - 1)] ? 0.0f : p[IX(i, j - 1)];
+
+        u[IX(i, j)] -= 0.5f * gridSize * (p_east - p_west);
+        v[IX(i, j)] -= 0.5f * gridSize * (p_north - p_south);
     END_FOR
 
-    // 修正后的速度场 u, v 再次设置边界条件，确保无散度速度场也满足边界条件。
+    enforce_obstacle_boundaries(gridSize, u, 1); // 强制障碍物单元格的 u 速度为0
+    enforce_obstacle_boundaries(gridSize, v, 2); // 强制障碍物单元格的 v 速度为0
     set_bnd(gridSize, 1, u);
     set_bnd(gridSize, 2, v);
 }
 
 /**
  * @brief 更新速度场。
- * @param gridSize 网格大小 N。
- * @param u 当前时刻 u 分量。
- * @param v 当前时刻 v 分量。
- * @param u0 前一时刻 u 分量 (用作输入源和临时缓冲区)。
- * @param v0 前一时刻 v 分量 (用作输入源和临时缓冲区)。
- * @param visc 粘度系数。
- * @param dt 时间步长。
- *
- * 速度场更新的步骤 (根据 Navier-Stokes 方程分解)：
- * 1. 添加外力 (Add Forces)。
- * 2. 计算粘性扩散 (Viscous Diffuse)。
- * 3. 投射操作 (Project) 消除散度。
- * 4. 计算自身平流 (Self-advection)。
- * 5. 再次投射操作 (Project) 消除散度，确保守恒性。
  */
 void vel_step(int gridSize, float *u, float *v, float *u0, float *v0, float visc, float dt) {
-    // 1. 添加外力：将前一时刻的速度场 u0, v0 作为外部源添加到当前速度场 u, v 中。
-    // 注意：这里的 u0, v0 实际上是用户输入或模拟中的外部力/速度增量。
     add_source(gridSize, u, u0, dt);
     add_source(gridSize, v, v0, dt);
-
-    // 2. 粘性扩散：计算速度场的扩散。
-    // 先交换 u 和 u0 的指针，使得 u0 存储当前速度，u 作为计算扩散结果的临时缓冲区。
+    
     SWAP(u0, u);
-    diffuse(gridSize, 1, u, u0, visc, dt); // 对 u 分量进行扩散计算，边界类型 b=1
+    diffuse(gridSize, 1, u, u0, visc, dt);
 
     SWAP(v0, v);
-    diffuse(gridSize, 2, v, v0, visc, dt); // 对 v 分量进行扩散计算，边界类型 b=2
+    diffuse(gridSize, 2, v, v0, visc, dt);
 
-    // 3. 投射操作：消除速度场中的散度，确保不可压缩性。
-    // u0, v0 在这里作为 project 函数内部临时存储压力 p 和散度 div 的缓冲区。
-    project(gridSize, u, v, u0, v0);
+    project(gridSize, u, v, u0, v0); // u0, v0 作为临时缓冲区 p 和 div
 
-    // 4. 自身平流：计算速度场随自身流动的平流效应。
-    // 再次交换 u 和 u0 的指针，使得 u0 存储扩散后的速度，u 作为计算平流结果的临时缓冲区。
-    // u0, v0 (交换后) 现在是平流运算的输入速度场 (advecting field)。
     SWAP(u0, u);
     SWAP(v0, v);
-    advect(gridSize, 1, u, u0, u0, v0, dt); // 对 u 分量进行平流计算，边界类型 b=1
-    advect(gridSize, 2, v, v0, u0, v0, dt); // 对 v 分量进行平流计算，边界类型 b=2
+    advect(gridSize, 1, u, u0, u0, v0, dt);
+    advect(gridSize, 2, v, v0, u0, v0, dt);
 
-    // 5. 再次投射操作：Stam 建议在平流之后再次进行投射，以确保数值稳定性并维持散度为零。
     project(gridSize, u, v, u0, v0);
 }
 
 /**
  * @brief 更新密度值（例如烟雾浓度）。
- * @param gridSize 网格大小 N。
- * @param x 当前时刻密度值。
- * @param x0 前一时刻密度值 (用作输入源和临时缓冲区)。
- * @param u 速度场 u 分量。
- * @param v 速度场 v 分量。
- * @param diff 密度扩散系数。
- * @param dt 时间步长。
- *
- * 密度更新的步骤 (根据密度更新方程)：
- * 1. 添加密度源 (Add Sources)。
- * 2. 计算密度扩散 (Diffuse)。
- * 3. 计算密度平流 (Move)。
  */
 void dens_step(int gridSize, float *x, float *x0, float *u, float *v, float diff, float dt) {
-    // 1. 添加密度源：将前一时刻的密度源 x0 累加到当前密度 x 中。
     add_source(gridSize, x, x0, dt);
 
-    // 2. 密度扩散：计算密度场的扩散。
     SWAP(x0, x);
-    diffuse(gridSize, 0, x, x0, diff, dt); // 对密度进行扩散计算，边界类型 b=0
+    diffuse(gridSize, 0, x, x0, diff, dt);
 
-    // 3. 密度平流：计算密度场随速度场 u, v 的平流效应。
     SWAP(x0, x);
-    advect(gridSize, 0, x, x0, u, v, dt); // 对密度进行平流计算，边界类型 b=0
+    advect(gridSize, 0, x, x0, u, v, dt);
+}
+
+//--------------------------------------------------------------------------------------
+// 障碍物初始化函数
+//--------------------------------------------------------------------------------------
+static void init_obstacles(void) {
+    // 障碍物：水平长条
+    int bar_y = N / 2 + 5; // 长条的 y 坐标
+    int bar_start_x = N / 4;
+    int bar_end_x = 3 * N / 4;
+    for (int i = bar_start_x; i <= bar_end_x; i++) {
+        is_obstacle[IX(i, bar_y)] = 1;
+        is_obstacle[IX(i, bar_y + 1)] = 1; // 增加厚度
+        is_obstacle[IX(i, bar_y - 1)] = 1; 
+    }
+
+    // 障碍物：圆形 
+    int circle_center_x = N / 2;
+    int circle_center_y = N / 4; // 圆心位置
+    int radius = N / 8;
+    for (int i = 1; i <= N; i++) {
+        for (int j = 1; j <= N; j++) {
+            float dist_sq = (i - circle_center_x) * (i - circle_center_x) +
+                            (j - circle_center_y) * (j - circle_center_y);
+            if (dist_sq < radius * radius) {
+                is_obstacle[IX(i, j)] = 1;
+            }
+        }
+    }
 }
 
 
@@ -435,28 +397,36 @@ void dens_step(int gridSize, float *x, float *x0, float *u, float *v, float diff
 // GLUT 相关函数和模拟主循环
 //--------------------------------------------------------------------------------------
 
-// 用于存储鼠标拖拽信息
-static int mouse_down[3]; // 鼠标按键状态
-static int last_x, last_y; // 上一帧鼠标位置
-
 // 初始化模拟状态
 void init_simulation() {
     if (!allocate_data()) {
         exit(1); // 内存分配失败，退出程序
     }
+    init_obstacles(); // 初始化障碍物
     printf("流体模拟初始化完成，网格大小: %dx%d\n", N, N);
+    printf("--- 键盘控制 ---\n");
+    printf("Esc: 退出程序\n");
+    printf("R: 设置绘制颜色为红色\n");
+    printf("G: 设置绘制颜色为绿色\n");
+    printf("B: 设置绘制颜色为蓝色\n");
+    printf("W: 设置绘制颜色为白色 (默认)\n");
+    printf("Y: 设置绘制颜色为黄色\n");
+    printf("C: 设置绘制颜色为青色\n");
+    printf("M: 设置绘制颜色为品红色\n");
+    printf("--- 鼠标控制 ---\n");
+    printf("鼠标左键拖拽: 添加密度源 (当前颜色)\n");
+    printf("鼠标右键拖拽: 添加速度源\n");
 }
 
 // 模拟步进函数
 void simulate_step() {
-    // 在这里处理用户输入（鼠标拖拽）作为速度和密度源
     int size = (N + 2) * (N + 2);
+    // 清空前一时刻的速度和所有颜色通道的密度源
     memset(u_prev, 0, size * sizeof(float));
     memset(v_prev, 0, size * sizeof(float));
-    memset(dens_prev, 0, size * sizeof(float));
-
-    // 示例：如果在窗口中央添加一个持续的密度源
-    // dens_prev[IX(N/2, N/2)] = 100.0f;
+    memset(dens_prev_r, 0, size * sizeof(float));
+    memset(dens_prev_g, 0, size * sizeof(float));
+    memset(dens_prev_b, 0, size * sizeof(float));
 
     // 用户输入处理（鼠标拖拽）
     // 鼠标左键添加密度，鼠标右键添加速度
@@ -465,25 +435,30 @@ void simulate_step() {
         int i = (int)((last_x / (float)win_width) * N) + 1;
         int j = (int)(((win_height - last_y) / (float)win_height) * N) + 1;
 
-        // 确保网格索引在有效范围内
-        if (i >= 1 && i <= N && j >= 1 && j <= N) {
+        // 确保网格索引在有效范围内，并且不是障碍物
+        if (i >= 1 && i <= N && j >= 1 && j <= N && !is_obstacle[IX(i,j)]) {
              if (mouse_down[0]) { // 左键添加密度
-                 dens_prev[IX(i, j)] = 100.0f; // 添加密度源
+                 // 根据当前绘制颜色添加密度源
+                 dens_prev_r[IX(i, j)] = current_draw_color[0] * 100.0f; 
+                 dens_prev_g[IX(i, j)] = current_draw_color[1] * 100.0f;
+                 dens_prev_b[IX(i, j)] = current_draw_color[2] * 100.0f;
              }
              if (mouse_down[2]) { // 右键添加速度
                  // 简单的速度添加，可以根据鼠标移动方向和速度进行改进
-                 u_prev[IX(i, j)] = (last_x - win_width / 2.0) * 0.005; // 示例速度源
-                 v_prev[IX(i, j)] = (win_height / 2.0 - last_y) * 0.005; // 示例速度源
+                 // 乘以 0.005 是一个经验值，用于控制速度强度
+                 u_prev[IX(i, j)] = (last_x - win_width / 2.0) * 0.005; 
+                 v_prev[IX(i, j)] = (win_height / 2.0 - last_y) * 0.005; 
              }
         }
     }
 
-
     // 更新速度场
     vel_step(N, u, v, u_prev, v_prev, visc, dt);
 
-    // 更新密度场
-    dens_step(N, dens, dens_prev, u, v, diff, dt);
+    // 更新密度场（每个颜色通道独立更新）
+    dens_step(N, dens_r, dens_prev_r, u, v, diff, dt);
+    dens_step(N, dens_g, dens_prev_g, u, v, diff, dt);
+    dens_step(N, dens_b, dens_prev_b, u, v, diff, dt);
 }
 
 
@@ -491,20 +466,27 @@ void simulate_step() {
 void display(void) {
     glClear(GL_COLOR_BUFFER_BIT); // 清除颜色缓冲区
 
-    // 使用密度值绘制网格
     glBegin(GL_QUADS); // 绘制四边形
     float h = 1.0f / N; // 每个网格的尺寸 (在 [0, 1] 范围内)
 
     for (int i = 0; i <= N + 1; i++) {
         for (int j = 0; j <= N + 1; j++) {
-            // 获取当前网格的密度值，并钳制在 [0, 1] 范围内用于颜色映射
-            float d = dens[IX(i, j)];
-            if (d < 0.0f) d = 0.0f;
-            if (d > 1.0f) d = 1.0f; // 可以根据需要调整密度到颜色的映射范围
+            if (is_obstacle[IX(i, j)]) {
+                // 如果是障碍物，绘制固定颜色
+                glColor3f(0.3f, 0.3f, 0.5f); // 暗蓝灰色
+            } else {
+                // 否则，使用 RGB 密度值绘制烟雾颜色
+                float dr = dens_r[IX(i, j)];
+                float dg = dens_g[IX(i, j)];
+                float db = dens_b[IX(i, j)];
 
-            // 将密度映射到灰度（或其他颜色）
-            // 这里使用灰度，密度越高颜色越亮
-            glColor3f(d, d, d); // 设置颜色 (R, G, B)
+                // 钳制颜色值在 [0, 1] 范围内
+                dr = fmax(0.0f, fmin(1.0f, dr));
+                dg = fmax(0.0f, fmin(1.0f, dg));
+                db = fmax(0.0f, fmin(1.0f, db));
+
+                glColor3f(dr, dg, db); // 设置颜色 (R, G, B)
+            }
 
             // 绘制当前网格单元的四边形
             // 网格坐标 (i, j) 对应窗口坐标 (i*h, j*h)
@@ -539,9 +521,33 @@ void reshape(int w, int h) {
 
 // GLUT 键盘事件处理
 void keyboard(unsigned char key, int x, int y) {
-    if (key == 27) { // 按下 Esc 键退出
-        free_data(); // 释放内存
-        exit(0);
+    switch (key) {
+        case 27: // 按下 Esc 键退出
+            free_data(); // 释放内存
+            exit(0);
+            break;
+        case 'r': case 'R': // 红色
+            current_draw_color[0] = 1.0f; current_draw_color[1] = 0.0f; current_draw_color[2] = 0.0f;
+            printf("绘制颜色: 红色\n"); break;
+        case 'g': case 'G': // 绿色
+            current_draw_color[0] = 0.0f; current_draw_color[1] = 1.0f; current_draw_color[2] = 0.0f;
+            printf("绘制颜色: 绿色\n"); break;
+        case 'b': case 'B': // 蓝色
+            current_draw_color[0] = 0.0f; current_draw_color[1] = 0.0f; current_draw_color[2] = 1.0f;
+            printf("绘制颜色: 蓝色\n"); break;
+        case 'w': case 'W': // 白色 (默认)
+            current_draw_color[0] = 1.0f; current_draw_color[1] = 1.0f; current_draw_color[2] = 1.0f;
+            printf("绘制颜色: 白色\n"); break;
+        case 'y': case 'Y': // 黄色
+            current_draw_color[0] = 1.0f; current_draw_color[1] = 1.0f; current_draw_color[2] = 0.0f;
+            printf("绘制颜色: 黄色\n"); break;
+        case 'c': case 'C': // 青色
+            current_draw_color[0] = 0.0f; current_draw_color[1] = 1.0f; current_draw_color[2] = 1.0f;
+            printf("绘制颜色: 青色\n"); break;
+        case 'm': case 'M': // 品红色
+            current_draw_color[0] = 1.0f; current_draw_color[1] = 0.0f; current_draw_color[2] = 1.0f;
+            printf("绘制颜色: 品红色\n"); break;
+        default: break;
     }
 }
 
@@ -566,9 +572,9 @@ void motion(int x, int y) {
 int main(int argc, char **argv) {
     // 初始化 GLUT
     glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB); // 双缓冲区，RGB 颜色模式
-    glutInitWindowSize(win_width, win_height); // 设置窗口尺寸
-    glutCreateWindow("流体模拟"); // 创建窗口并设置标题
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB); 
+    glutInitWindowSize(win_width, win_height); 
+    glutCreateWindow("Fliud Simulation"); 
 
     // 初始化 OpenGL 状态
     glClearColor(0.0, 0.0, 0.0, 1.0); // 设置清除颜色为黑色

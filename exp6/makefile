@@ -4,4 +4,6 @@ CFLAGS = -Wall
 LDFLAGS = -lglut -lGL -lGLU -lm -lSOIL
 
 main: main.c
-	$(CXX) $< -o $@ $(LDFLAGS)
+	$(CC) $< -o $@ $(LDFLAGS)
+demo: demo.c solver.c
+	$(CC) $^ -o $@ $(LDFLAGS)
